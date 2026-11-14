@@ -1,0 +1,11 @@
+# 변형에 강건한 얼굴 사진 보호 프로그램 (LPID) v1.0 — 의존 패키지
+#   pip install -r requirements.txt
+#
+# GPU 를 사용하는 경우 PyTorch 는 설치 환경의 CUDA 버전에 맞는 배포본을
+# https://pytorch.org 의 안내에 따라 설치한다.
+
+torch>=2.0
+torchvision>=0.15
+numpy>=1.24
+Pillow>=9.5
+facenet-pytorch>=2.5.3

@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Protected outputs / noise / user photos (never commit personal images)
+protected/
+my_photos/
+reference_ids/
+*.npz
+*.png
+!figs/*.svg
+!figs/*.png
+
+# Data, checkpoints, large artifacts (not part of this tool repo)
+*.pt
+*.pth
+*.ckpt
+imdb/
+colab_backups/
+datasets/
+
+# OS
+.DS_Store

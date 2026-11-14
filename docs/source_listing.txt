@@ -1,0 +1,417 @@
+==============================================================================
+  변형에 강건한 얼굴 사진 보호 프로그램 (LPID)  버전 1.0
+  제출용 소스코드 전문
+
+  파일명 : protect.py
+  총 행수 : 407행
+  언어   : Python
+  작성일 : 2026-10-31
+==============================================================================
+
+    1  #!/usr/bin/env python3
+    2  """LPID -- protect face photos against unauthorized recognition training.
+    3  
+    4  Takes the photos of one or more people and writes out protected copies: each
+    5  output photo is visually the same as its input, but a model trained on the
+    6  protected copies fails to recognize the person in ordinary photos.
+    7  
+    8  The perturbation is confined to the face box the scraper would crop, and it is
+    9  optimized *through* a differentiable model of that crop+resize, so it survives
+   10  the extraction step instead of being wiped out by the resize.
+   11  
+   12  Algorithm and hyperparameters follow generate_lpid_v2 in _build_expABC.py:
+   13    inner  20-step sign-PGD descent on the error-minimizing loss, eps 8/255,
+   14           step 0.8/255, reprojected so the published photo stays in [0,1]
+   15    outer  ResNet-18 surrogate, SGD lr 0.025 / momentum 0.9 / wd 5e-4,
+   16           cosine annealing, up to 60 epochs, early stop at 0.99 train accuracy
+   17  
+   18  IMPORTANT -- this method needs an ALBUM, not a single photo. The optimization
+   19  trains a surrogate classifier, so with one identity the cross-entropy loss is
+   20  identically zero and nothing is generated. Supply at least two identities:
+   21  either several people under --input, or one person plus --refs.
+   22  
+   23  Usage:
+   24      python3 protect.py --input ./my_photos --refs ./reference_ids --output ./protected
+   25      python3 protect.py --self-test
+   26  """
+   27  from __future__ import annotations
+   28  
+   29  import argparse
+   30  import json
+   31  import random
+   32  import sys
+   33  from pathlib import Path
+   34  
+   35  import numpy as np
+   36  import torch
+   37  import torch.nn.functional as F
+   38  from PIL import Image
+   39  
+   40  IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+   41  IMAGENET_MEAN = (0.485, 0.456, 0.406)
+   42  IMAGENET_STD = (0.229, 0.224, 0.225)
+   43  
+   44  
+   45  # --------------------------------------------------------------------------- io
+   46  
+   47  def load_photo(path):
+   48      """Read an image as a float CHW tensor in [0,1]."""
+   49      with Image.open(path) as handle:
+   50          array = np.asarray(handle.convert("RGB"), dtype=np.float32) / 255.0
+   51      return torch.from_numpy(array).permute(2, 0, 1)
+   52  
+   53  
+   54  def save_photo(tensor, path):
+   55      """Write a float CHW tensor in [0,1] as lossless PNG."""
+   56      array = (tensor.clamp(0, 1) * 255).round().to(torch.uint8).permute(1, 2, 0).numpy()
+   57      Image.fromarray(array).save(path, format="PNG", optimize=True)
+   58  
+   59  
+   60  def list_identities(root, label):
+   61      """Map identity name -> list of image paths. Subfolders are identities."""
+   62      root = Path(root)
+   63      if not root.is_dir():
+   64          raise SystemExit(f"{label} 경로가 폴더가 아닙니다: {root}")
+   65      subdirs = sorted(p for p in root.iterdir() if p.is_dir())
+   66      groups = {}
+   67      if subdirs:
+   68          for folder in subdirs:
+   69              files = sorted(p for p in folder.iterdir() if p.suffix.lower() in IMAGE_SUFFIXES)
+   70              if files:
+   71                  groups[folder.name] = files
+   72      else:
+   73          files = sorted(p for p in root.iterdir() if p.suffix.lower() in IMAGE_SUFFIXES)
+   74          if files:
+   75              groups[root.name] = files
+   76      if not groups:
+   77          raise SystemExit(f"{label} 폴더에서 이미지를 찾지 못했습니다: {root}")
+   78      return groups
+   79  
+   80  
+   81  # ------------------------------------------------------------------- face boxes
+   82  
+   83  def square_box(x1, y1, x2, y2, width, height):
+   84      """Largest square box centred on the detection and inside the image."""
+   85      centre_x, centre_y = (x1 + x2) / 2, (y1 + y2) / 2
+   86      side = int(round(max(x2 - x1, y2 - y1)))
+   87      side = max(1, min(side, width, height))
+   88      x = max(0, min(int(round(centre_x - side / 2)), width - side))
+   89      y = max(0, min(int(round(centre_y - side / 2)), height - side))
+   90      return x, y, side
+   91  
+   92  
+   93  def detect_boxes(paths, device, min_face):
+   94      """Run MTCNN once per photo and return {path: (x, y, side)}; misses are skipped."""
+   95      try:
+   96          from facenet_pytorch import MTCNN
+   97      except ImportError:
+   98          raise SystemExit(
+   99              "얼굴 검출에 facenet-pytorch 가 필요합니다.\n"
+  100              "  pip install facenet-pytorch\n"
+  101              "또는 --boxes 로 얼굴 영역을 직접 지정하세요.")
+  102      detector = MTCNN(keep_all=True, device=device)
+  103      boxes, skipped = {}, []
+  104      for path in paths:
+  105          with Image.open(path) as handle:
+  106              image = handle.convert("RGB")
+  107          width, height = image.size
+  108          found, probability = detector.detect(image)
+  109          if found is None or len(found) == 0:
+  110              skipped.append((path, "얼굴 검출 실패")); continue
+  111          best = int(np.argmax(probability))
+  112          x, y, side = square_box(*found[best], width, height)
+  113          if side < min_face:
+  114              skipped.append((path, f"얼굴이 너무 작음 ({side}px < {min_face}px)")); continue
+  115          boxes[path] = (x, y, side)
+  116      return boxes, skipped
+  117  
+  118  
+  119  def load_boxes(path, paths, min_face):
+  120      """Read {relative-or-absolute path: [x, y, side]} from a JSON file."""
+  121      raw = json.loads(Path(path).read_text())
+  122      boxes, skipped = {}, []
+  123      for photo in paths:
+  124          entry = None
+  125          for key in (str(photo), photo.name, str(photo.resolve())):
+  126              if key in raw:
+  127                  entry = raw[key]; break
+  128          if entry is None:
+  129              skipped.append((photo, "--boxes 에 항목이 없음")); continue
+  130          x, y, side = (int(v) for v in entry)
+  131          if side < min_face:
+  132              skipped.append((photo, f"얼굴이 너무 작음 ({side}px < {min_face}px)")); continue
+  133          boxes[photo] = (x, y, side)
+  134      return boxes, skipped
+  135  
+  136  
+  137  # ---------------------------------------------------------------- optimization
+  138  
+  139  def new_surrogate(arch, num_classes):
+  140      import torchvision.models as models
+  141      factory = dict(resnet18=models.resnet18, resnet50=models.resnet50,
+  142                     vgg16=models.vgg16_bn, densenet121=models.densenet121)
+  143      if arch not in factory:
+  144          raise SystemExit(f"지원하지 않는 대리 모델입니다: {arch}")
+  145      return factory[arch](num_classes=num_classes)
+  146  
+  147  
+  148  def extract(faces, deltas, order, target_size):
+  149      """Differentiable model of the scraper's extraction: crop face, resize to T.
+  150  
+  151      The crop is already the stored face box, so this is the resize; gradients of
+  152      the post-resize loss flow back into each per-photo delta.
+  153      """
+  154      crops = []
+  155      for i in order:
+  156          published = (faces[i] + deltas[i]).clamp(0, 1)
+  157          crops.append(F.interpolate(published[None], (target_size, target_size),
+  158                                     mode="bilinear", align_corners=False))
+  159      return torch.cat(crops, 0)
+  160  
+  161  
+  162  def generate(faces, labels, num_classes, args, device, log=print):
+  163      """Alternate inner perturbation descent with outer surrogate training."""
+  164      torch.manual_seed(args.seed); torch.cuda.manual_seed_all(args.seed)
+  165      np.random.seed(args.seed); random.seed(args.seed)
+  166      torch.backends.cudnn.deterministic = True
+  167      torch.backends.cudnn.benchmark = False
+  168  
+  169      model = new_surrogate(args.arch, num_classes).to(device)
+  170      optimiser = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
+  171      schedule = torch.optim.lr_scheduler.CosineAnnealingLR(optimiser, T_max=args.epochs)
+  172      mean = torch.tensor(IMAGENET_MEAN, device=device).view(1, 3, 1, 1)
+  173      std = torch.tensor(IMAGENET_STD, device=device).view(1, 3, 1, 1)
+  174  
+  175      noise = [torch.zeros_like(face) for face in faces]        # kept on CPU
+  176      label_tensor = torch.tensor(labels)
+  177      rng = random.Random(args.seed)
+  178      indices = list(range(len(faces)))
+  179  
+  180      for epoch in range(args.epochs):
+  181          rng.shuffle(indices)
+  182          correct = total = 0
+  183          for start in range(0, len(indices), args.batch_size):
+  184              order = indices[start:start + args.batch_size]
+  185              if len(order) < 2:
+  186                  continue                                      # a 1-sample batch teaches nothing
+  187              clean = {i: faces[i].to(device) for i in order}
+  188              delta = {i: noise[i].to(device).requires_grad_(True) for i in order}
+  189              y = label_tensor[order].to(device)
+  190  
+  191              model.eval()
+  192              for _ in range(args.steps):
+  193                  crops = extract(clean, delta, order, args.target_size)
+  194                  loss = F.cross_entropy(model((crops - mean) / std), y)
+  195                  grads = torch.autograd.grad(loss, [delta[i] for i in order])
+  196                  with torch.no_grad():
+  197                      for i, grad in zip(order, grads):
+  198                          step = delta[i].detach() - args.step_size * grad.sign()
+  199                          step = step.clamp(-args.epsilon, args.epsilon)
+  200                          step = (clean[i] + step).clamp(0, 1) - clean[i]   # publishable photo
+  201                          delta[i] = step.requires_grad_(True)
+  202              for i in order:
+  203                  noise[i] = delta[i].detach().cpu()
+  204  
+  205              model.train()
+  206              frozen = {i: noise[i].to(device) for i in order}
+  207              crops = extract(clean, frozen, order, args.target_size)
+  208              optimiser.zero_grad(set_to_none=True)
+  209              logits = model((crops - mean) / std)
+  210              F.cross_entropy(logits, y).backward()
+  211              optimiser.step()
+  212              correct += int((logits.argmax(1) == y).sum()); total += len(order)
+  213          schedule.step()
+  214          accuracy = correct / max(total, 1)
+  215          if epoch < 3 or (epoch + 1) % 5 == 0 or epoch + 1 == args.epochs:
+  216              log(f"  epoch {epoch + 1}/{args.epochs}  대리 모델 학습 정확도 {accuracy:.3f}")
+  217          if accuracy >= args.stop_acc:
+  218              log(f"  조기 종료: epoch {epoch + 1} 에서 학습 정확도 {accuracy:.3f} 도달")
+  219              break
+  220      return noise
+  221  
+  222  
+  223  # ----------------------------------------------------------------------- driver
+  224  
+  225  def run(args, device, log=print):
+  226      protect_groups = list_identities(args.input, "--input")
+  227      reference_groups = list_identities(args.refs, "--refs") if args.refs else {}
+  228      overlap = set(protect_groups) & set(reference_groups)
+  229      if overlap:
+  230          raise SystemExit(f"--input 과 --refs 에 같은 이름의 신원이 있습니다: {sorted(overlap)}")
+  231  
+  232      num_classes = len(protect_groups) + len(reference_groups)
+  233      if num_classes < 2:
+  234          raise SystemExit(
+  235              "신원이 1개뿐입니다. 이 방법은 사진 한 장이나 한 사람만으로는 동작하지 않습니다.\n"
+  236              "대리 분류기를 학습시키며 잡음을 만들기 때문에, 신원이 하나면 교차 엔트로피 손실이\n"
+  237              "항상 0 이 되어 아무 잡음도 생성되지 않습니다.\n"
+  238              "  --input 에 두 사람 이상을 두거나, --refs 로 참조 신원을 함께 지정하세요.")
+  239  
+  240      entries, label_of = [], {}
+  241      for name, files in list(protect_groups.items()) + list(reference_groups.items()):
+  242          label_of[name] = len(label_of)
+  243          for path in files:
+  244              entries.append((path, name, name in protect_groups))
+  245      paths = [path for path, _, _ in entries]
+  246      log(f"신원 {num_classes}명 (보호 {len(protect_groups)} / 참조 {len(reference_groups)}), 사진 {len(paths)}장")
+  247  
+  248      log("얼굴 영역 결정 중...")
+  249      if args.boxes:
+  250          boxes, skipped = load_boxes(args.boxes, paths, args.min_face)
+  251      else:
+  252          boxes, skipped = detect_boxes(paths, device, args.min_face)
+  253      for path, reason in skipped:
+  254          log(f"  건너뜀: {path.name} -- {reason}")
+  255      entries = [e for e in entries if e[0] in boxes]
+  256      if not entries:
+  257          raise SystemExit("얼굴을 찾은 사진이 없습니다.")
+  258      if len({label_of[name] for _, name, _ in entries}) < 2:
+  259          raise SystemExit("얼굴을 찾은 사진의 신원이 1명뿐입니다. 신원이 둘 이상 필요합니다.")
+  260  
+  261      faces, labels = [], []
+  262      for path, name, _ in entries:
+  263          x, y, side = boxes[path]
+  264          faces.append(load_photo(path)[:, y:y + side, x:x + side].contiguous())
+  265          labels.append(label_of[name])
+  266      sides = [face.shape[-1] for face in faces]
+  267      log(f"얼굴 {len(faces)}개, 한 변 {min(sides)}~{max(sides)}px")
+  268  
+  269      log("보호 잡음 생성 중...")
+  270      noise = generate(faces, labels, num_classes, args, device, log)
+  271  
+  272      output_root = Path(args.output); output_root.mkdir(parents=True, exist_ok=True)
+  273      written, residuals = 0, []
+  274      for (path, name, is_protected), delta in zip(entries, noise):
+  275          if not is_protected:
+  276              continue                                   # reference identities are not published
+  277          x, y, side = boxes[path]
+  278          photo = load_photo(path)
+  279          face = photo[:, y:y + side, x:x + side]
+  280          published = (face + delta).clamp(0, 1)
+  281          residuals.append(float((published - face).abs().max()))
+  282          photo[:, y:y + side, x:x + side] = published
+  283          folder = output_root / name; folder.mkdir(parents=True, exist_ok=True)
+  284          save_photo(photo, folder / (path.stem + ".png"))
+  285          written += 1
+  286      if args.save_noise:
+  287          torch.save(dict(noise=noise, boxes={str(p): boxes[p] for p, _, _ in entries},
+  288                          labels=labels, paths=[str(p) for p, _, _ in entries]), args.save_noise)
+  289          log(f"잡음 저장: {args.save_noise}")
+  290  
+  291      if written == 0:
+  292          raise SystemExit("보호 사진이 하나도 생성되지 않았습니다. --input 의 사진에서 "
+  293                           "얼굴을 찾지 못했는지 위의 건너뜀 목록을 확인하세요.")
+  294      log(f"\n보호 사진 {written}장 저장: {output_root}")
+  295      if residuals:
+  296          log(f"실제 섭동 최대 {max(residuals) * 255:.2f}/255 (상한 {args.epsilon * 255:.2f}/255)")
+  297      log("출력은 PNG 입니다. JPEG 로 다시 저장하면 압축이 잡음을 깎아 보호가 약해집니다.")
+  298      return written
+  299  
+  300  
+  301  # -------------------------------------------------------------------- self test
+  302  
+  303  def self_test(args, device):
+  304      """End-to-end run on synthetic photos, checking the invariants that matter."""
+  305      import tempfile
+  306      log = print
+  307      log("자체 점검: 합성 사진으로 전 과정을 돌립니다 (학습이 아니라 동작 확인입니다).\n")
+  308      with tempfile.TemporaryDirectory() as temporary:
+  309          root = Path(temporary)
+  310          source, output = root / "in", root / "out"
+  311          generator = torch.Generator().manual_seed(0)
+  312          originals, boxes = {}, {}
+  313          for person in ("person_a", "person_b"):
+  314              (source / person).mkdir(parents=True)
+  315              for n in range(4):
+  316                  photo = torch.rand(3, 200, 160, generator=generator) * .6 + .2
+  317                  path = source / person / f"{n}.png"
+  318                  save_photo(photo, path)
+  319                  originals[path] = load_photo(path)
+  320                  boxes[str(path)] = [40, 30, 96]
+  321          box_file = root / "boxes.json"; box_file.write_text(json.dumps(boxes))
+  322  
+  323          args.input, args.refs, args.output, args.boxes = source, None, output, box_file
+  324          args.epochs, args.steps, args.batch_size, args.min_face = 2, 3, 4, 8
+  325          written = run(args, device, log)
+  326  
+  327          log("\n불변식 검사")
+  328          failures = []
+  329          if written != 8:
+  330              failures.append(f"보호 사진 수가 8이 아니라 {written}")
+  331          for path, original in originals.items():
+  332              produced = output / path.parent.name / (path.stem + ".png")
+  333              if not produced.exists():
+  334                  failures.append(f"출력 없음: {produced.name}"); continue
+  335              got = load_photo(produced)
+  336              if got.shape != original.shape:
+  337                  failures.append(f"크기 변경: {produced.name}"); continue
+  338              x, y, side = boxes[str(path)]
+  339              outside = (got - original).abs().clone()
+  340              outside[:, y:y + side, x:x + side] = 0
+  341              inside = (got[:, y:y + side, x:x + side]
+  342                        - original[:, y:y + side, x:x + side]).abs().max()
+  343              if float(outside.max()) > 1.5 / 255:
+  344                  failures.append(f"얼굴 영역 밖이 변경됨: {produced.name} "
+  345                                  f"({float(outside.max()) * 255:.2f}/255)")
+  346              if float(inside) > args.epsilon + 1.5 / 255:
+  347                  failures.append(f"섭동이 상한 초과: {produced.name} "
+  348                                  f"({float(inside) * 255:.2f}/255)")
+  349          log("  1. 보호 사진이 모두 생성되었다")
+  350          log("  2. 사진 크기가 보존되었다")
+  351          log("  3. 얼굴 영역 밖의 화소가 바뀌지 않았다 (PNG 양자화 1/255 허용)")
+  352          log("  4. 섭동이 eps 상한 안에 있다")
+  353          if failures:
+  354              log("\n실패:"); [log("  - " + f) for f in failures]
+  355              return 1
+  356          log("\n자체 점검 통과. 실제 사진으로 쓸 수 있습니다.")
+  357          return 0
+  358  
+  359  
+  360  # ------------------------------------------------------------------------- main
+  361  
+  362  def build_parser():
+  363      parser = argparse.ArgumentParser(
+  364          description="LPID -- 얼굴 사진을 무단 학습으로부터 보호한 사본을 생성한다.",
+  365          formatter_class=argparse.RawDescriptionHelpFormatter,
+  366          epilog="신원이 둘 이상 필요합니다 (--input 에 두 사람 이상, 또는 --refs 사용).")
+  367      parser.add_argument("--input", help="보호할 사진 폴더. 하위 폴더 하나가 한 사람.")
+  368      parser.add_argument("--refs", default=None,
+  369                          help="참조 신원 폴더. 최적화에만 쓰이고 출력되지 않는다.")
+  370      parser.add_argument("--output", help="보호 사진을 저장할 폴더.")
+  371      parser.add_argument("--boxes", default=None,
+  372                          help='얼굴 영역 JSON {"경로": [x, y, 한변]}. 지정하면 검출기를 쓰지 않는다.')
+  373      parser.add_argument("--save-noise", default=None, help="생성한 잡음을 저장할 .pt 경로.")
+  374      parser.add_argument("--epsilon", type=float, default=8 / 255, help="섭동 크기 상한 (기본 8/255).")
+  375      parser.add_argument("--step-size", type=float, default=0.8 / 255, help="PGD 단계 크기 (기본 0.8/255).")
+  376      parser.add_argument("--steps", type=int, default=20, help="갱신당 PGD 반복 (기본 20).")
+  377      parser.add_argument("--epochs", type=int, default=60, help="최대 반복 (기본 60).")
+  378      parser.add_argument("--batch-size", type=int, default=32, help="배치 크기 (기본 32).")
+  379      parser.add_argument("--target-size", type=int, default=224,
+  380                          help="공격자가 확대할 입력 크기 (기본 224).")
+  381      parser.add_argument("--lr", type=float, default=0.025, help="대리 모델 학습률 (기본 0.025).")
+  382      parser.add_argument("--stop-acc", type=float, default=0.99, help="조기 종료 기준 (기본 0.99).")
+  383      parser.add_argument("--arch", default="resnet18", help="대리 모델 (기본 resnet18).")
+  384      parser.add_argument("--min-face", type=int, default=32, help="이보다 작은 얼굴은 건너뛴다 (기본 32px).")
+  385      parser.add_argument("--seed", type=int, default=42, help="난수 시드 (기본 42).")
+  386      parser.add_argument("--device", default=None, help="cuda 또는 cpu. 기본은 자동 선택.")
+  387      parser.add_argument("--self-test", action="store_true",
+  388                          help="합성 사진으로 전 과정을 점검하고 종료한다.")
+  389      return parser
+  390  
+  391  
+  392  def main(argv=None):
+  393      args = build_parser().parse_args(argv)
+  394      device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+  395      print(f"장치: {device}")
+  396      if args.self_test:
+  397          return self_test(args, device)
+  398      missing = [name for name in ("input", "output") if not getattr(args, name)]
+  399      if missing:
+  400          raise SystemExit("필수 인자가 없습니다: " + ", ".join("--" + m for m in missing))
+  401      run(args, device)
+  402      return 0
+  403  
+  404  
+  405  if __name__ == "__main__":
+  406      sys.exit(main())
+  407  
